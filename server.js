@@ -73,13 +73,14 @@ app.post('/api/rooms/create', (req, res) => {
         return res.status(409).json({ error: 'Room code already exists' });
     }
 
+    // FIXED: Use consistent 'action' property instead of 'playing'
     const room = {
         code: roomCode,
         videoId: videoId,
         host: hostName || 'Host',
         createdAt: Date.now(),
         state: {
-            playing: false,
+            action: 'pause',  // Changed from 'playing: false' to 'action: pause'
             currentTime: 0,
             timestamp: Date.now()
         },
@@ -134,7 +135,8 @@ app.get('/api/rooms', (req, res) => {
             videoId: room.videoId,
             host: room.host,
             viewerCount: roomConnections ? roomConnections.size : 0,
-            createdAt: room.createdAt
+            createdAt: room.createdAt,
+            state: room.state  // Added state to debug endpoint
         };
     });
 
@@ -212,13 +214,14 @@ wss.on('connection', (ws) => {
         currentRoomCode = roomCode;
 
         console.log(`👤 ${username} (${userId}) joined room ${roomCode}`);
+        console.log(`📊 Current room state:`, room.state);
 
-        // Send success message to user
+        // FIXED: Send the complete current state to the joining user
         ws.send(JSON.stringify({
             type: 'joined',
             roomCode: roomCode,
             videoId: room.videoId,
-            state: room.state,
+            state: room.state,  // This now has consistent 'action' property
             viewerCount: roomConnections.size
         }));
 
@@ -235,7 +238,7 @@ wss.on('connection', (ws) => {
         const room = rooms.get(currentRoomCode);
         if (!room) return;
 
-        // Update room state
+        // Update room state with consistent structure
         room.state = {
             action: data.action,
             currentTime: data.currentTime,
