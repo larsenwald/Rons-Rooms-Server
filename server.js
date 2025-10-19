@@ -7,9 +7,8 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Enable CORS for GitHub Pages and local development
 app.use(cors({
-    origin: '*', // In production, replace with your GitHub Pages URL
+    origin: '*',
     credentials: true
 }));
 
@@ -21,9 +20,21 @@ const rooms = new Map();
 // Store WebSocket connections by room code
 const connections = new Map();
 
+// INACTIVITY TIMEOUT: 20 minutes in milliseconds
+const INACTIVITY_TIMEOUT = 20 * 60 * 1000;
+
 // Helper function to generate unique user ID
 function generateUserId() {
     return Math.random().toString(36).substring(2, 15);
+}
+
+// Helper function to update room activity
+function updateRoomActivity(roomCode) {
+    const room = rooms.get(roomCode);
+    if (room) {
+        room.lastActivity = Date.now();
+        console.log(`🕐 Room ${roomCode} activity updated`);
+    }
 }
 
 // Helper function to broadcast to all users in a room except sender
@@ -55,9 +66,14 @@ app.get('/', (req, res) => {
     res.json({
         status: 'online',
         service: 'Ron\'s Rooms Backend',
-        version: '1.0.0',
+        version: '2.0.0',
         activeRooms: rooms.size,
-        totalConnections: Array.from(connections.values()).reduce((sum, room) => sum + room.size, 0)
+        totalConnections: Array.from(connections.values()).reduce((sum, room) => sum + room.size, 0),
+        features: {
+            syncAcknowledgment: true,
+            inactivityTimeout: '20 minutes',
+            smartRoomCleanup: true
+        }
     });
 });
 
@@ -73,18 +89,21 @@ app.post('/api/rooms/create', (req, res) => {
         return res.status(409).json({ error: 'Room code already exists' });
     }
 
-    // FIXED: Use consistent 'action' property instead of 'playing'
+    const now = Date.now();
+    
     const room = {
         code: roomCode,
         videoId: videoId,
         host: hostName || 'Host',
-        createdAt: Date.now(),
+        createdAt: now,
+        lastActivity: now,
         state: {
-            action: 'pause',  // Changed from 'playing: false' to 'action: pause'
+            action: 'pause',
             currentTime: 0,
-            timestamp: Date.now()
+            timestamp: now
         },
-        viewers: []
+        viewers: [],
+        syncedViewers: new Set() // Track which viewers have acknowledged sync
     };
 
     rooms.set(roomCode, room);
@@ -121,29 +140,38 @@ app.get('/api/rooms/:roomCode', (req, res) => {
             videoId: room.videoId,
             host: room.host,
             state: room.state,
-            viewerCount: viewerCount
+            viewerCount: viewerCount,
+            lastActivity: room.lastActivity
         }
     });
 });
 
 // REST API: List all active rooms (for debugging)
 app.get('/api/rooms', (req, res) => {
+    const now = Date.now();
     const roomList = Array.from(rooms.values()).map(room => {
         const roomConnections = connections.get(room.code);
+        const inactiveDuration = now - room.lastActivity;
+        const isInactive = inactiveDuration > INACTIVITY_TIMEOUT;
+        
         return {
             code: room.code,
             videoId: room.videoId,
             host: room.host,
             viewerCount: roomConnections ? roomConnections.size : 0,
             createdAt: room.createdAt,
-            state: room.state  // Added state to debug endpoint
+            lastActivity: room.lastActivity,
+            inactiveMinutes: Math.floor(inactiveDuration / 60000),
+            willDeleteSoon: isInactive && (!roomConnections || roomConnections.size === 0),
+            state: room.state
         };
     });
 
     res.json({
         success: true,
         rooms: roomList,
-        totalRooms: rooms.size
+        totalRooms: rooms.size,
+        inactivityTimeout: '20 minutes'
     });
 });
 
@@ -165,6 +193,10 @@ wss.on('connection', (ws) => {
 
                 case 'sync':
                     handleSync(data, userId);
+                    break;
+
+                case 'sync_ack':
+                    handleSyncAcknowledgment(data, userId);
                     break;
 
                 case 'leave':
@@ -204,6 +236,9 @@ wss.on('connection', (ws) => {
             return;
         }
 
+        // Update room activity when someone joins
+        updateRoomActivity(roomCode);
+
         // Add connection to room
         if (!connections.has(roomCode)) {
             connections.set(roomCode, new Set());
@@ -216,12 +251,12 @@ wss.on('connection', (ws) => {
         console.log(`👤 ${username} (${userId}) joined room ${roomCode}`);
         console.log(`📊 Current room state:`, room.state);
 
-        // FIXED: Send the complete current state to the joining user
+        // Send current state to joining user
         ws.send(JSON.stringify({
             type: 'joined',
             roomCode: roomCode,
             videoId: room.videoId,
-            state: room.state,  // This now has consistent 'action' property
+            state: room.state,
             viewerCount: roomConnections.size
         }));
 
@@ -238,7 +273,13 @@ wss.on('connection', (ws) => {
         const room = rooms.get(currentRoomCode);
         if (!room) return;
 
-        // Update room state with consistent structure
+        // Update room activity on ANY playback action (play, pause, seek)
+        updateRoomActivity(currentRoomCode);
+
+        // Clear synced viewers set - everyone needs to re-acknowledge
+        room.syncedViewers.clear();
+
+        // Update room state
         room.state = {
             action: data.action,
             currentTime: data.currentTime,
@@ -256,10 +297,37 @@ wss.on('connection', (ws) => {
         }, userId);
     }
 
+    function handleSyncAcknowledgment(data, userId) {
+        if (!currentRoomCode) return;
+
+        const room = rooms.get(currentRoomCode);
+        if (!room) return;
+
+        // Add this viewer to synced set
+        room.syncedViewers.add(userId);
+
+        const roomConnections = connections.get(currentRoomCode);
+        const totalViewers = roomConnections ? roomConnections.size : 0;
+        const syncedCount = room.syncedViewers.size;
+
+        console.log(`✓ User ${userId} acknowledged sync in ${currentRoomCode} (${syncedCount}/${totalViewers - 1} synced)`);
+
+        // Notify host about sync acknowledgment
+        broadcastToRoom(currentRoomCode, {
+            type: 'sync_ack',
+            userId: userId,
+            syncedCount: syncedCount,
+            totalViewers: totalViewers - 1, // Exclude host
+            allSynced: syncedCount >= totalViewers - 1
+        }, userId);
+    }
+
     function handleLeaveRoom(userId) {
         if (!currentRoomCode) return;
 
         const roomConnections = connections.get(currentRoomCode);
+        const room = rooms.get(currentRoomCode);
+        
         if (roomConnections) {
             // Remove user from room
             roomConnections.forEach((conn) => {
@@ -267,6 +335,11 @@ wss.on('connection', (ws) => {
                     roomConnections.delete(conn);
                 }
             });
+
+            // Remove from synced viewers
+            if (room) {
+                room.syncedViewers.delete(userId);
+            }
 
             console.log(`👋 User ${userId} left room ${currentRoomCode}`);
 
@@ -276,11 +349,14 @@ wss.on('connection', (ws) => {
                 viewerCount: roomConnections.size
             });
 
-            // Clean up empty rooms
+            // CRITICAL: Only delete room if it's completely empty
             if (roomConnections.size === 0) {
                 connections.delete(currentRoomCode);
                 rooms.delete(currentRoomCode);
-                console.log(`🗑️  Room ${currentRoomCode} deleted (empty)`);
+                console.log(`🗑️  Room ${currentRoomCode} deleted (empty - 0 viewers)`);
+            } else {
+                // Room still has people, just update activity
+                updateRoomActivity(currentRoomCode);
             }
         }
 
@@ -293,36 +369,80 @@ wss.on('connection', (ws) => {
     }
 });
 
-// Cleanup old rooms every 10 minutes
+// ENHANCED CLEANUP: Check rooms every 2 minutes
 setInterval(() => {
     const now = Date.now();
-    const maxAge = 24 * 60 * 60 * 1000; // 24 hours
 
     rooms.forEach((room, roomCode) => {
-        const age = now - room.createdAt;
         const roomConnections = connections.get(roomCode);
-        
-        // Delete room if it's old and empty
-        if (age > maxAge && (!roomConnections || roomConnections.size === 0)) {
+        const viewerCount = roomConnections ? roomConnections.size : 0;
+        const inactiveDuration = now - room.lastActivity;
+
+        // RULE 1: Delete if room is empty (0 viewers)
+        if (viewerCount === 0) {
             rooms.delete(roomCode);
             connections.delete(roomCode);
-            console.log(`🗑️  Cleaned up old room: ${roomCode}`);
+            console.log(`🗑️  Room ${roomCode} deleted - REASON: Empty (0 viewers)`);
+            return;
+        }
+
+        // RULE 2: Delete if inactive (paused) for 20+ minutes
+        if (inactiveDuration > INACTIVITY_TIMEOUT) {
+            // Notify all viewers that room is closing due to inactivity
+            broadcastToRoomAll(roomCode, {
+                type: 'room_closing',
+                reason: 'inactivity',
+                message: 'Room closed due to 20 minutes of inactivity'
+            });
+
+            // Close all connections gracefully
+            if (roomConnections) {
+                roomConnections.forEach((conn) => {
+                    if (conn.ws.readyState === WebSocket.OPEN) {
+                        conn.ws.close(1000, 'Room closed due to inactivity');
+                    }
+                });
+            }
+
+            rooms.delete(roomCode);
+            connections.delete(roomCode);
+            
+            const inactiveMinutes = Math.floor(inactiveDuration / 60000);
+            console.log(`🗑️  Room ${roomCode} deleted - REASON: Inactive for ${inactiveMinutes} minutes (no playback activity)`);
         }
     });
-}, 10 * 60 * 1000);
+
+    // Log cleanup summary
+    const activeRooms = rooms.size;
+    if (activeRooms > 0) {
+        console.log(`\n📊 Cleanup cycle complete - ${activeRooms} active rooms remaining`);
+        rooms.forEach((room, code) => {
+            const inactiveMinutes = Math.floor((now - room.lastActivity) / 60000);
+            const roomConns = connections.get(code);
+            const viewers = roomConns ? roomConns.size : 0;
+            console.log(`   - ${code}: ${viewers} viewers, inactive for ${inactiveMinutes}m`);
+        });
+    }
+}, 2 * 60 * 1000); // Check every 2 minutes
 
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`
 ╔════════════════════════════════════════╗
-║       RON'S ROOMS - BACKEND SERVER     ║
+║    RON'S ROOMS - ENHANCED BACKEND      ║
 ╚════════════════════════════════════════╝
 
 🚀 Server running on port ${PORT}
 🌐 HTTP: http://localhost:${PORT}
 🔌 WebSocket: ws://localhost:${PORT}
 
-Ready to sync watch parties! ✨
+✨ Features:
+   - Sync Acknowledgment System
+   - Smart Room Cleanup
+   - 20-Minute Inactivity Timeout
+   - Real-time Activity Tracking
+
+Ready to sync watch parties! 🎬
     `);
 });
